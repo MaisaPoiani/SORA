@@ -378,7 +378,7 @@ class Occultation:
                       format(normal_vel))
 
     @deprecated_alias(log='verbose')  # remove this line in v1.0
-    def new_astrometric_position(self, time=None, offset=None, error=None, verbose=True, observer=None, sun_ld=False):
+    def new_astrometric_position(self, time=None, offset=None, error=None, verbose=True, observer=None, ld=False, massives=['sun', 'jupiter', 'saturn']):
         """Calculates the new astrometric position for the object given fitted parameters.
 
         Parameters
@@ -419,11 +419,19 @@ class Occultation:
             IAU code of the observer (must be present in given list of kernels),
             a SORA observer object or a string: ['geocenter', 'barycenter']
 
-        sun_ld : `bool`
-            If true, it computes the differential light deflection caused by the Sun
+         ld : `bool`
+            If true, it computes the differential light deflection caused by massive bodies
             in the starlight before being occulted.
+        
+        massives : `list`
+            List of massive bodies to consider for light deflection calculation.
+            Default is ['sun', 'jupiter', 'saturn'].
         """
         from astropy.coordinates import SkyCoord, SkyOffsetFrame
+        import astropy.units as u
+        import numpy as np
+        from astropy.time import Time
+        import warnings
 
         if time is not None:
             time = Time(time)
@@ -486,22 +494,41 @@ class Occultation:
             e_off_ra = np.arctan2(e_off_ra, distance)
             e_off_dec = np.arctan2(e_off_dec, distance)
 
-        if sun_ld:
-            from .utils import calc_sun_dif_ld
+        if ld:
+            from .utils import calc_massives_ld
 
             pos_star = self.star.get_position(time=time, observer=observer)
-            ndra, nddec = calc_sun_dif_ld(body_coord=coord, star_coord=pos_star, time=time, observer=observer)
-            off_ra -= ndra
-            off_dec -= nddec
-            print('Differential Sun Light Deflection included (mas): DRA={:.3f}, DDEC={:.3f}'.format(
-                  ndra.to(u.mas).value, nddec.to(u.mas).value))
+            
+            #calling function calc_massives_ld
+            df_ld = calc_massives_ld(body_coord=coord, star_coord=pos_star, time=time, observer=observer, massives=massives)
+            
+            #try pushing dRA e dDEC from table
+            try:
+                #line 1 (index 0) is about occulting body
+                occulting_row = df_ld[df_ld['body'] == 'Occulting'].iloc[0]
+                dRA = float(occulting_row['dRA (mas)']) * u.mas
+                dDEC = float(occulting_row['dDEC (mas)']) * u.mas
+            except (IndexError, KeyError):
+                occulting_row = df_ld.iloc[0]
+                dRA = float(occulting_row['dRA (mas)']) * u.mas
+                dDEC = float(occulting_row['dDEC (mas)']) * u.mas
+            
+            #applying offset
+            off_ra += dRA
+            off_dec += dDEC
+            
+            #print information about light deflection
+            if verbose:
+                print(f'Differential Light Deflection included (mas): DRA={dRA.value:.3f}, DDEC={dDEC.value:.3f}')
+                print(f'Massive bodies considered: {", ".join(massives)}')
 
         new_pos = SkyCoord(lon=off_ra, lat=off_dec, frame=coord_frame)
         new_pos = new_pos.icrs
 
         error_star = self.star.error_at(self.tca)
-        error_ra = np.sqrt(error_star[0]**2 + e_off_ra**2)
-        error_dec = np.sqrt(error_star[1]**2 + e_off_dec**2)
+        error_ra  = np.sqrt(error_star[0].to(u.mas)**2 + e_off_ra.to(u.mas)**2)
+        error_dec = np.sqrt(error_star[1].to(u.mas)**2 + e_off_dec.to(u.mas)**2)
+
 
         out = 'Ephemeris offset (km): X = {:.1f} +/- {:.1f}; Y = {:.1f} +/- {:.1f}\n'.format(
             distance*np.sin(off_ra.to(u.mas)).value, distance*np.sin(e_off_ra.to(u.mas)).value,
@@ -514,7 +541,7 @@ class Occultation:
             new_pos.dec.to_string(u.deg, precision=6, sep=' '), error_dec.to(u.mas).value)
 
         if verbose:
-            print(out)
+            print(out) #return string
         else:
             return out
 
