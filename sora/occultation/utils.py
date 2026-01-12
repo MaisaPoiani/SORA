@@ -286,3 +286,176 @@ def calc_sun_dif_ld(body_coord, star_coord, time, observer="geocenter"):
     dra_s, ddec_s = star_coord.spherical_offsets_to(os_star)  # computes offset between corrected and astrometric
 
     return dra_b - dra_s, ddec_b - ddec_s
+
+def calc_massives_ld(body_coord, star_coord, time, observer, massives=['sun', 'jupiter', 'saturn']):
+    #the standard massive list contains Sun, Jupiter and Saturn
+    
+    #new imports
+    from sora.observer import Observer
+    from astropy.time import Time
+    from astropy.coordinates import SkyCoord, CartesianRepresentation
+    import pandas as pd
+    from sora.ephem import EphemHorizons
+
+    G = const.G.to(u.AU**3 / u.kg / u.day**2)
+    c = const.c.to(u.AU/u.day)
+    gamma = 1
+
+    #if it's not informed a time format, assume UTC
+    if not isinstance(time, Time):
+        time = Time(time, scale='utc')
+        
+    #defining massive bodys of Solar System
+    massive_data = {
+        'sun': {'name': 'Sun', 'spkid': 10, 'mass': 1 * u.M_sun},
+        'mercury': {'name': 'Mercury', 'spkid': 199, 'mass': 3.3011e23 * u.kg},
+        'venus': {'name': 'Venus', 'spkid': 299, 'mass': 4.8675e24 * u.kg},
+        'earth': {'name': 'Earth', 'spkid': 399, 'mass': const.M_earth},
+        'mars': {'name': 'Mars', 'spkid': 499, 'mass': 6.4171e23 * u.kg},
+        'jupiter': {'name': 'Jupiter', 'spkid': 599, 'mass': const.M_jup},
+        'saturn': {'name': 'Saturn', 'spkid': 699, 'mass': 5.6834e26 * u.kg},
+        'uranus': {'name': 'Uranus', 'spkid': 799, 'mass': 8.6810e25 * u.kg},
+        'neptune': {'name': 'Neptune', 'spkid': 899, 'mass': 1.024e26 * u.kg}
+    }
+
+    #creating a list of massives from their names
+    massives_list = []
+    
+    for massive_name in massives:
+        massive_name_lower = massive_name.lower().strip()
+
+        if massive_name_lower in massive_data:
+            data = massive_data[massive_name_lower]
+            body = Body(
+                name=data['name'],
+                spkid=str(data['spkid']),
+                ephem=EphemHorizons(
+                    name=data['spkid'], #to ensure unique identification
+                    spkid=data['spkid'],
+                    id_type='majorbody'
+                ),
+                GM=const.G * data['mass'],
+                database=None
+            )
+            massives_list.append(body)
+
+        else:
+            print(f"Sorry, '{massive_name}' it's not a valid massive body. Available options: {', '.join(massive_data.keys())}")
+
+    #eq 70 Klioner (2003)
+    def explicit_delta_k_pN(G, gamma, M_a, c, R, r_eA, r_oA, r_eA_uni, r_oA_uni):
+        term1 = (((1 + gamma) * G * M_a) / c**2)
+        numerator = R.cross(r_eA.cross(r_oA))
+        denominator = R.norm() * r_oA.norm() * (r_eA.norm() * r_oA.norm() + r_oA.dot(r_eA))
+        return -term1 * (numerator / denominator)
+
+    def deflection(observador, fonte, massive, mass):
+        r_oA = observador - massive
+        r_oA_uni = r_oA / r_oA.norm()
+        r_eA = fonte - massive
+        r_eA_uni = r_eA / r_eA.norm()
+        R = observador - fonte
+        R_uni = CartesianRepresentation(R.x / R.norm(), R.y / R.norm(), R.z / R.norm())
+        vecDeflection = explicit_delta_k_pN(G, gamma, mass, c, R, r_eA, r_oA, r_eA_uni, r_oA_uni)
+        return vecDeflection, R_uni
+
+
+    table_lines = [] #empty table
+
+    #getting bodys positions
+    cart_body = body_coord.cartesian
+    cart_body_AU = CartesianRepresentation(x=cart_body.x.to(u.AU),
+                                                y=cart_body.y.to(u.AU), z=cart_body.z.to(u.AU))
+
+    cart_star =  star_coord.cartesian
+    cart_star_AU = CartesianRepresentation(x=cart_star.x.to(u.AU),
+                                               y=cart_star.y.to(u.AU), z=cart_star.z.to(u.AU))
+
+    r_obs = observer.get_vector(time)
+    cart_observer = r_obs.cartesian
+    cart_observer_AU = CartesianRepresentation(x=cart_observer.x.to(u.AU),
+                                                 y=cart_observer.y.to(u.AU), z=cart_observer.z.to(u.AU))
+
+    #the initial deflection is null, vectorially adding for each massive body
+    vecDeflectionBody_total = CartesianRepresentation(0, 0, 0)
+    vecDeflectionStar_total = CartesianRepresentation(0, 0, 0)
+
+    for massive in massives_list:
+        pos_ephem_massive = massive.get_position(time=time, observer=observer)
+        cart_massive = pos_ephem_massive.cartesian
+        cart_massive_AU = CartesianRepresentation(x=cart_massive.x.to(u.AU), y=cart_massive.y.to(u.AU), z=cart_massive.z.to(u.AU))
+        M_massive = massive.GM/G
+
+        vecDeflectionStar, R_uni = deflection(cart_observer_AU, cart_body_AU, cart_massive_AU, M_massive)
+        vecDeflectionBody, _ = deflection(cart_observer_AU, cart_star_AU, cart_massive_AU, M_massive)
+        vecDeflectionBody_total += vecDeflectionStar
+        vecDeflectionStar_total += vecDeflectionBody
+
+    #the relative light deflection that affects the occulting body
+    vecDeflectionSub = vecDeflectionStar_total - vecDeflectionBody_total
+    sinthetaSub = (vecDeflectionSub).norm().decompose()
+    deflection_sub = np.arcsin(sinthetaSub)
+    astrometric_correction = cart_body_AU.norm() * np.sin(deflection_sub)
+
+    #getting the apparent position of related bodys
+    v = cart_body_AU - cart_observer_AU
+    v_unit = v / v.norm()
+    v_apparent = v_unit + vecDeflectionSub
+    v_apparent = v_apparent / v_apparent.norm()
+    pos_apparent_body = cart_observer_AU + v_apparent * v.norm()
+    coord_apparent_body = SkyCoord(pos_apparent_body, frame='icrs', representation_type='cartesian')
+    coord_body = SkyCoord(cart_body_AU, frame='icrs', representation_type='cartesian')
+    dra_apparent_body, ddec_apparent_body = coord_apparent_body.spherical_offsets_to(coord_body)
+
+    v_s = cart_star_AU - cart_observer_AU
+    v_unit_s = v_s / v_s.norm()
+    v_apparent_s = v_unit_s + vecDeflectionSub
+    v_apparent_s = v_apparent_s / v_apparent_s.norm()
+    pos_apparent_star = cart_observer_AU + v_apparent_s * v_s.norm()
+    coord_apparent_star = SkyCoord(pos_apparent_star, frame='icrs', representation_type='cartesian')
+    coord_star = SkyCoord(cart_star_AU, frame='icrs', representation_type='cartesian')
+    dra_apparent_star, ddec_apparent_star = coord_apparent_star.spherical_offsets_to(coord_star)
+
+    #building the returning table
+    table_lines.append({
+        'body': 'Occulting',
+        'RA ephem (deg)': f"{coord_body.spherical.lon.deg:.10f}",
+        'DEC ephem (deg)': f"{coord_body.spherical.lat.deg:.10f}",
+        'astrometric correction (km)': f"{astrometric_correction.to(u.km).value:.10f}",
+        'RA apparent (deg)': f"{coord_apparent_body.spherical.lon.deg:.10f}",
+        'DEC apparent (deg)': f"{coord_apparent_body.spherical.lat.deg:.10f}",
+        'dRA (mas)': f"{dra_apparent_body.mas:.10f}",
+        'dDEC (mas)': f"{ddec_apparent_body.mas:.10f}"
+    })
+
+    table_lines.append({
+        'body': 'Star',
+        'RA ephem (deg)': f"{coord_star.spherical.lon.deg:.10f}",
+        'DEC ephem (deg)': f"{coord_star.spherical.lat.deg:.10f}",
+        'astrometric correction (km)': f"{astrometric_correction.to(u.km).value:.10f}",
+        'RA apparent (deg)': f"{coord_apparent_star.spherical.lon.deg:.10f}",
+        'DEC apparent (deg)': f"{coord_apparent_star.spherical.lat.deg:.10f}",
+        'dRA (mas)': f"{dra_apparent_star.mas:.10f}",
+        'dDEC (mas)': f"{ddec_apparent_star.mas:.10f}"
+    })
+
+    #showing each massive body information
+    for massive in massives_list:
+        pos_ephem_massive = massive.get_position(time=time, observer=observer)
+        cart_massive = pos_ephem_massive.cartesian
+        cart_massive_AU = CartesianRepresentation(x=cart_massive.x.to(u.AU), y=cart_massive.y.to(u.AU), z=cart_massive.z.to(u.AU))
+        coord_massive = SkyCoord(cart_massive_AU, frame='icrs', representation_type='cartesian')
+        table_lines.append({
+            'body': f"massive {massive.name}",
+            'RA ephem (deg)': f"{coord_massive.spherical.lon.deg:.10f}",
+            'DEC ephem (deg)': f"{coord_massive.spherical.lat.deg:.10f}",
+            'astrometric correction (km)': '',
+            'RA apparent (deg)': '',
+            'DEC apparent (deg)': '',
+            'dRA (mas)': '',
+            'dDEC (mas)': ''
+        })
+
+    #returning the complete table
+    df = pd.DataFrame(table_lines)
+    return df
